@@ -135,7 +135,7 @@ python generate_mixed.py \
     --network=output/fusion/.../network-snapshot-XXXXXX.pkl \
     --outdir=output/interpolation \
     --seeds=0-4 \
-    --alphas=0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0
+    --alphas=0.0,...,1.0
 ```
 
 Here, `alpha=0.0` represents the first dataset and `alpha=1.0` represents the
@@ -148,9 +148,8 @@ need to be adapted according to the target project:
 
 1. Model loading and weight-saving formats.
 2. Intermediate feature or layer-wise parameter structures.
-3. The generator forward pass.
-4. Training losses and optimizer parameters.
-5. Checkpoint saving and model inference scripts.
+3. Training losses and optimizer parameters.
+4. Checkpoint saving and model inference scripts.
 
 The files `training/urgan_fatm.py` and `training/urgan_pdfm.py` demonstrate how
 the two modules are integrated into StyleGAN2-ADA.
