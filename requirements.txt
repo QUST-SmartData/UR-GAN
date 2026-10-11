@@ -1,0 +1,7 @@
+click
+numpy
+Pillow
+psutil
+requests
+scipy
+wandb
