@@ -151,8 +151,6 @@ need to be adapted according to the target project:
 3. Training losses and optimizer parameters.
 4. Checkpoint saving and model inference scripts.
 
-The files `training/urgan_fatm.py` and `training/urgan_pdfm.py` demonstrate how
-the two modules are integrated into StyleGAN2-ADA.
 
 ## Acknowledgements
 
