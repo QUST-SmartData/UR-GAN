@@ -26,28 +26,6 @@ The current project uses StyleGAN2-ADA as an example. FATM and PDFM can also be
 adapted to other GAN projects according to their network structures, training
 procedures, and model formats.
 
-## Usage
-
-### Requirements
-
-This project requires:
-
-```text
-PyTorch
-NumPy
-SciPy
-Pillow
-Click
-psutil
-wandb
-```
-
-Install PyTorch according to your CUDA version, then install the remaining
-dependencies:
-
-```bash
-pip install -r requirements.txt
-```
 
 ### Datasets and pretrained models
 
