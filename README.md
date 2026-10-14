@@ -32,9 +32,6 @@ procedures, and model formats.
 Place your datasets in the `datasets` directory. The dataset can be an image
 directory or a `.zip` file in the StyleGAN2-ADA format.
 
-Training data and pretrained models are not included in this repository. After
-training, replace the model paths in the commands below with the generated
-`network-snapshot-*.pkl` files.
 
 ### Train new models
 
