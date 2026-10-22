@@ -26,6 +26,22 @@ The current project uses StyleGAN2-ADA as an example. FATM and PDFM can also be
 adapted to other GAN projects according to their network structures, training
 procedures, and model formats.
 
+## Usage
+
+### Requirements
+
+This project requires:
+
+```plain
+Python
+pytorch
+torchvision
+numpy
+scipy
+Pillow
+Click
+psutil
+```
 
 ### Datasets and pretrained models
 
