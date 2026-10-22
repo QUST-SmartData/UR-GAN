@@ -15,9 +15,6 @@ from training.merge_utils import extend_GAN_embeddings
 def root_model(input_model: str, output_model: str, new_classes: int):
     """Root a model by extending its class dimensions.
     
-    This script implements the first stage of GAN Cocktail: model rooting.
-    It extends the class dimensions of a trained model to support more classes.
-    
     Examples:
     
     \b
@@ -46,11 +43,10 @@ def root_model(input_model: str, output_model: str, new_classes: int):
     
     print(f'Rooted model classes: {output_G.c_dim}')
     
-    # Create new model data
     rooted_model_data = {
         'G_ema': output_G,
         'D': output_D,
-        'G': output_G,  # Also save as G for compatibility
+        'G': output_G,
         'training_set_kwargs': model_data.get('training_set_kwargs', {}),
         'augment_pipe': model_data.get('augment_pipe', None),
     }
@@ -61,7 +57,7 @@ def root_model(input_model: str, output_model: str, new_classes: int):
             rooted_model_data[key] = model_data[key]
     
     print(f'Saving rooted model to "{output_model}"...')
-    os.makedirs(os.path.dirname(output_model), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_model)), exist_ok=True)
     
     with open(output_model, 'wb') as f:
         pickle.dump(rooted_model_data, f)

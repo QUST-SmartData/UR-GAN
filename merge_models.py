@@ -15,9 +15,6 @@ from training.hybrid_model import HybridGenerator, HybridDiscriminator
 def merge_models(model_paths: list, output_model: str, weights: list):
     """Merge multiple models by weight averaging.
     
-    This script implements the second stage of GAN Cocktail: model merging.
-    It creates a hybrid model by averaging the weights of multiple models.
-    
     Examples:
     
     \b
@@ -96,7 +93,7 @@ def merge_models(model_paths: list, output_model: str, weights: list):
     merged_model_data = {
         'G_ema': hybrid_generator,
         'D': hybrid_discriminator,
-        'G': hybrid_generator,  # Also save as G for compatibility
+        'G': hybrid_generator,
         'training_set_kwargs': {},
         'augment_pipe': None,
     }
@@ -109,7 +106,7 @@ def merge_models(model_paths: list, output_model: str, weights: list):
                 merged_model_data[key] = first_model_data[key]
     
     print(f'Saving merged model to "{output_model}"...')
-    os.makedirs(os.path.dirname(output_model), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_model)), exist_ok=True)
     
     with open(output_model, 'wb') as f:
         pickle.dump(merged_model_data, f)

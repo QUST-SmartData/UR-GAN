@@ -13,7 +13,6 @@ import os
 import click
 import re
 import json
-import inspect
 import tempfile
 import torch
 import dnnlib
@@ -55,11 +54,11 @@ def setup_training_loop_kwargs(
     init_merge_discriminator = None, # Indicator to use the first merge discriminator as initializer
     hybrid_mode = None, # Indicator for "hybrid mode" - use a model with averaging the weights
     hybrid_model_paths = None,  # The source pickles of the second fine-tuned models (from the first merge generator)
-    use_fatm = None,   # UR-GAN：权重对齐阶段启用 FATM（与 --merge_mode 联用，扎根/对齐训练）
-    use_pdfm = None,   # UR-GAN：权重融合阶段启用 PDFM 逐层系数（与 --hybrid_mode 联用）
-    urgan_align_lambda = None,      # 3.5 权重正则系数 λ；None 表示按 use_fatm 自动默认
-    urgan_fusion_lambda = None,     # 3.5 融合约束系数 μ；None 表示按 use_pdfm 自动默认
-    urgan_align_ref_index = None,   # 对齐基准生成器在 merge_model_paths 中的下标，默认 0（G_A）
+    use_fatm = None,   # Enable feature-adaptive alignment.
+    use_pdfm = None,   # Enable layer-wise dynamic fusion.
+    urgan_align_lambda = None,      # Weight alignment regularization strength.
+    urgan_fusion_lambda = None,     # Fusion balance regularization strength.
+    urgan_align_ref_index = None,   # Reference generator index for alignment.
 
     # Base config.
     cfg        = None, # Base config: 'auto' (default), 'stylegan2', 'paper256', 'paper512', 'paper1024', 'cifar'
@@ -74,7 +73,7 @@ def setup_training_loop_kwargs(
     augpipe    = None, # Augmentation pipeline: 'blit', 'geom', 'color', 'filter', 'noise', 'cutout', 'bg', 'bgc' (default), ..., 'bgcfnc'
 
     # Transfer learning.
-    resume     = None, # Load previous network: 'noresume' (default), 'ffhq256', 'ffhq512', 'ffhq1024', 'celebahq256', 'lsundog256', <file>, <url>
+    resume     = None, # Checkpoint path, URL, or pretrained model name.
     freezed    = None, # Freeze-D: <int>, default = 0 discriminator layers
 
     # Performance options (not included in desc).
@@ -122,9 +121,13 @@ def setup_training_loop_kwargs(
     # -----------------------------------
 
     # Handle merge mode vs single dataset mode
+    if hybrid_mode and not merge_mode:
+        raise UserError('--hybrid_mode=True requires --merge_mode=True')
     if merge_mode:
-        assert data_paths is not None, "Must provide data_paths for merge mode"
-        assert num_classes is not None, "Must provide num_classes for merge mode"
+        if not data_paths or num_classes != len(data_paths):
+            raise UserError('--num_classes must match the number of --data_paths')
+        if len(merge_model_paths or []) != len(data_paths):
+            raise UserError('Provide one --merge_model_paths entry per dataset')
         args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.MergedImageFolderDataset', 
                                                    paths=data_paths, 
                                                    num_classes=num_classes, 
@@ -132,7 +135,8 @@ def setup_training_loop_kwargs(
                                                    max_size=None, 
                                                    xflip=False)
     else:
-        assert data is not None, "Must provide data for single dataset mode"
+        if data is None:
+            raise UserError('--data is required for single-dataset training')
         assert isinstance(data, str)
         args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', 
                                                    path=data, 
@@ -147,6 +151,7 @@ def setup_training_loop_kwargs(
         args.training_set_kwargs.use_labels = training_set.has_labels # be explicit about labels
         args.training_set_kwargs.max_size = len(training_set) # be explicit about dataset size
         desc = training_set.name
+        training_set.close()
         del training_set # conserve memory
     except IOError as err:
         raise UserError(f'--data: {err}')
@@ -158,7 +163,7 @@ def setup_training_loop_kwargs(
         if not args.training_set_kwargs.use_labels:
             raise UserError('--cond=True requires labels specified in dataset.json')
         desc += '-cond'
-    else:
+    elif not merge_mode:
         args.training_set_kwargs.use_labels = False
 
     if subset is not None:
@@ -194,10 +199,8 @@ def setup_training_loop_kwargs(
     args.init_merge_discriminator = init_merge_discriminator
     
     if hybrid_mode:
-        assert hybrid_model_paths is not None, "Must provide a hybrid_model_paths"
-        if root_model_path is None:
-            # We assume that if there is no alternative root path, we would like to use all the "aligned models"
-            assert len(hybrid_model_paths) == (len(merge_model_paths) - 1), "Wrong number of hybrid model paths"
+        if not hybrid_model_paths or len(hybrid_model_paths) != len(merge_model_paths) - 1:
+            raise UserError('Provide one --hybrid_model_paths entry per non-root model')
     args.hybrid_mode = hybrid_mode
     args.hybrid_model_paths = hybrid_model_paths
 
@@ -210,9 +213,11 @@ def setup_training_loop_kwargs(
     args.use_fatm = use_fatm
     args.use_pdfm = use_pdfm
     if use_pdfm and not hybrid_mode:
-        raise UserError('--use_pdfm 需要同时指定 --hybrid_mode True（权重融合阶段）。')
-    if use_fatm and not merge_mode:
-        raise UserError('--use_fatm 需要同时指定 --merge_mode True（权重对齐阶段）。')
+        raise UserError('--use_pdfm=True requires --hybrid_mode=True')
+    if use_fatm and (not merge_mode or hybrid_mode):
+        raise UserError('--use_fatm=True requires merge mode without hybrid mode')
+    if (use_fatm or use_pdfm) and len(data_paths) != 2:
+        raise UserError('FATM and PDFM require exactly two source datasets and models')
 
     if urgan_align_lambda is None:
         urgan_align_lambda = 1e-3 if (use_fatm and merge_mode and not hybrid_mode) else 0.0
@@ -220,14 +225,21 @@ def setup_training_loop_kwargs(
         urgan_fusion_lambda = 1e-3 if (use_pdfm and hybrid_mode) else 0.0
     if urgan_align_ref_index is None:
         urgan_align_ref_index = 0
+    if urgan_align_lambda < 0 or urgan_fusion_lambda < 0:
+        raise UserError('Regularization strengths must be non-negative')
+    if merge_mode and not 0 <= urgan_align_ref_index < len(merge_model_paths):
+        raise UserError('--urgan-align-ref-index must identify a source model')
 
     # Handle class percentages for merge mode
     if args.merge_mode:
         if class_percentages is None or len(class_percentages) == 0:
             actual_classes = len(data_paths)
             class_percentages = [1.0 / actual_classes] * actual_classes
+        if (len(data_paths) != len(class_percentages)
+                or any(not 0 <= value <= 1 for value in class_percentages)
+                or abs(sum(class_percentages) - 1.0) > 1e-6):
+            raise UserError('--class_percentages must be non-negative and sum to 1')
         args.class_percentages = class_percentages
-        assert len(data_paths) == len(class_percentages)
 
     # ------------------------------------
     # Base config: cfg, gamma, kimg, batch
@@ -240,7 +252,7 @@ def setup_training_loop_kwargs(
 
     cfg_specs = {
         'auto':      dict(ref_gpus=-1, kimg=25000,  mb=-1, mbstd=-1, fmaps=-1,  lrate=-1,     gamma=-1,   ema=-1,  ramp=0.05, map=2), # Populated dynamically based on resolution and GPU count.
-        'stylegan2': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=8), # Uses mixed-precision, unlike the original StyleGAN2.
+        'stylegan2': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=10,   ema=10,  ramp=None, map=8),
         'paper256':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=0.5, lrate=0.0025, gamma=1,    ema=20,  ramp=None, map=8),
         'paper512':  dict(ref_gpus=8,  kimg=25000,  mb=64, mbstd=8,  fmaps=1,   lrate=0.0025, gamma=0.5,  ema=20,  ramp=None, map=8),
         'paper1024': dict(ref_gpus=8,  kimg=25000,  mb=32, mbstd=4,  fmaps=1,   lrate=0.002,  gamma=2,    ema=10,  ramp=None, map=8),
@@ -277,9 +289,6 @@ def setup_training_loop_kwargs(
     args.G_kwargs.synthesis_kwargs.conv_clamp = args.D_kwargs.conv_clamp = 256 # clamp activations to avoid float16 overflow
     args.D_kwargs.epilogue_kwargs.mbstd_group_size = spec.mbstd
     
-    # Note: img_channels is handled in common_kwargs in training_loop.py
-    # No need to set it here as it would cause duplicate keyword argument error
-
     args.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
     args.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=spec.lrate, betas=[0,0.99], eps=1e-8)
     args.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss', r1_gamma=spec.gamma)
@@ -323,10 +332,11 @@ def setup_training_loop_kwargs(
         args.batch_size = batch
         args.batch_gpu = batch // gpus
 
-    # FATM 双路合成显存约为单路 2 倍；未手动指定 --batch 时默认将总 batch 压到 4
+    # Limit the default FATM batch to reduce dual-branch memory use.
     if use_fatm and merge_mode and not hybrid_mode and batch is None and args.batch_size > 4:
-        args.batch_size = 4
-        args.batch_gpu = max(1, args.batch_size // gpus)
+        args.batch_size = max(4, gpus)
+        args.batch_gpu = args.batch_size // gpus
+    args.D_kwargs.epilogue_kwargs.mbstd_group_size = min(spec.mbstd, args.batch_gpu)
 
     # ---------------------------------------------------
     # Discriminator augmentation: aug, p, target, augpipe
@@ -488,22 +498,7 @@ def subprocess_fn(rank, args, temp_dir):
     if rank != 0:
         custom_ops.verbosity = 'none'
 
-    # Execute training loop (UR-GAN 开关单独传入，避免旧版 training_loop 收到未知 **kwargs)
-    loop_args = dnnlib.EasyDict(args)
-    use_fatm = bool(loop_args.pop('use_fatm', False))
-    use_pdfm = bool(loop_args.pop('use_pdfm', False))
-    loop_sig = inspect.signature(training_loop.training_loop)
-    if use_fatm and 'use_fatm' not in loop_sig.parameters:
-        raise RuntimeError(
-            '已设置 --use_fatm，但 training/training_loop.py 仍是旧版本（缺少 use_fatm 参数）。'
-            '请从本机同步：training/training_loop.py、training/urgan_fatm.py、training/loss.py'
-        )
-    if use_pdfm and 'use_pdfm' not in loop_sig.parameters:
-        raise RuntimeError(
-            '已设置 --use_pdfm，但 training/training_loop.py 仍是旧版本（缺少 use_pdfm 参数）。'
-            '请同步 training/training_loop.py、training/urgan_pdfm.py、training/loss.py'
-        )
-    training_loop.training_loop(rank=rank, use_fatm=use_fatm, use_pdfm=use_pdfm, **loop_args)
+    training_loop.training_loop(rank=rank, **args)
 
 #----------------------------------------------------------------------------
 
@@ -549,8 +544,8 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--hybrid_model_paths', help='Paths to hybrid models for weight averaging', multiple=True)
 @click.option('--use_fatm', help='UR-GAN: enable FATM in merge training (weight alignment)', type=bool, default=False, metavar='BOOL')
 @click.option('--use_pdfm', help='UR-GAN: enable PDFM in hybrid training (weight fusion)', type=bool, default=False, metavar='BOOL')
-@click.option('--urgan-align-lambda', help='UR-GAN sec3.5: weight drift λ vs baseline G (default: 1e-3 if --use_fatm else 0)', type=float, default=None, metavar='FLOAT')
-@click.option('--urgan-fusion-lambda', help='UR-GAN sec3.5: fusion balance μ on α (default: 1e-3 if --use_pdfm else 0)', type=float, default=None, metavar='FLOAT')
+@click.option('--urgan-align-lambda', help='Weight alignment penalty [default: 1e-3 with FATM, otherwise 0]', type=float, default=None, metavar='FLOAT')
+@click.option('--urgan-fusion-lambda', help='Fusion balance penalty [default: 1e-3 with PDFM, otherwise 0]', type=float, default=None, metavar='FLOAT')
 @click.option('--urgan-align-ref-index', help='Index of baseline generator in merge_model_paths for align loss', type=int, default=None, metavar='INT')
 
 # Base config.
@@ -662,6 +657,10 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     if dry_run:
         print('Dry run; exiting.')
         return
+    if not torch.cuda.is_available():
+        ctx.fail('Training requires a CUDA-enabled PyTorch installation and an NVIDIA GPU')
+    if args.num_gpus > torch.cuda.device_count():
+        ctx.fail('--gpus exceeds the number of available CUDA devices')
 
     # Create output directory.
     print('Creating output directory...')

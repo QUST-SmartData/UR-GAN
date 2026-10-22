@@ -35,14 +35,12 @@ def generate_mixed_images(network_path, outdir, seeds, alphas, is3d_steps, trunc
     python generate_mixed.py --network=model.pkl --outdir=output/mixed --trunc=0.7
     """
     
-    # Parse seeds
     if '-' in seeds:
         start, end = map(int, seeds.split('-'))
         seed_list = list(range(start, end + 1))
     else:
         seed_list = [int(x.strip()) for x in seeds.split(',')]
     
-    # Parse alphas
     if is3d_steps and is3d_steps > 0:
         if is3d_steps < 2:
             raise click.ClickException('--is3D must be >= 2 (need to include alpha=0 and alpha=1).')
@@ -53,7 +51,6 @@ def generate_mixed_images(network_path, outdir, seeds, alphas, is3d_steps, trunc
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Loading network from "{network_path}"...')
     
-    # Load model
     with dnnlib.util.open_url(network_path) as f:
         G = legacy.load_network_pkl(f)['G_ema'].to(device)
     
@@ -69,14 +66,11 @@ def generate_mixed_images(network_path, outdir, seeds, alphas, is3d_steps, trunc
     if is3d_steps and is3d_steps > 0:
         print(f'3D output directory: {outdir_3d}')
     
-    # Generate images and create row images directly
     for seed in seed_list:
         print(f'Generating row for seed {seed}...')
         
-        # Generate random noise for this seed
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
         
-        # Collect images for this seed
         row_images = []
         # When --is3D is enabled, also save individual frames in-order under outdir/3D/
         if is3d_steps and is3d_steps > 0:
@@ -89,13 +83,12 @@ def generate_mixed_images(network_path, outdir, seeds, alphas, is3d_steps, trunc
             c = torch.tensor([[1-alpha, alpha]], dtype=torch.float32, device=device)
             
             with torch.no_grad():
-                # Generate image
                 img = G(z, c, truncation_psi=truncation_psi, noise_mode=noise_mode)
                 img = (img.permute(0,2,3,1) * 127.5 + 128).clamp(0,255).to(torch.uint8)[0].cpu().numpy()
                 
                 # Convert to PIL Image with binary thresholding
                 if img.shape[2] == 1:  # Single channel (grayscale)
-                    img = img.squeeze(2)  # Remove channel dimension
+                    img = img.squeeze(2)
                     # Apply binary thresholding (threshold = 128)
                     img_binary = (img > 128).astype(np.uint8) * 255
                     pil_img = PIL.Image.fromarray(img_binary, 'L')
@@ -110,8 +103,7 @@ def generate_mixed_images(network_path, outdir, seeds, alphas, is3d_steps, trunc
                 row_images.append(pil_img)
 
                 if is3d_steps and is3d_steps > 0:
-                    # Save individual frame with stable ordering by index.
-                    # Also include alpha in name for readability.
+                    # Index-prefixed names preserve frame order.
                     frame_name = f'frame{alpha_idx:0{frame_digits}d}_alpha{alpha:.6f}.png'
                     pil_img.save(os.path.join(frames_dir, frame_name))
         
@@ -137,27 +129,22 @@ def create_single_row_image(outdir, seed, row_images, alpha_list):
         print(f"No images for seed {seed}")
         return
     
-    # Get image dimensions
     img_width, img_height = row_images[0].size
     
-    # Create row image
     cols = len(row_images)
     row_width = cols * img_width
     row_height = img_height
     
-    # Create canvas
     if row_images[0].mode == 'L':  # Grayscale
         row_img = PIL.Image.new('L', (row_width, row_height), 255)
     else:  # RGB
         row_img = PIL.Image.new('RGB', (row_width, row_height), (255, 255, 255))
     
-    # Paste images into row
     for col_idx, img in enumerate(row_images):
         x = col_idx * img_width
         y = 0
         row_img.paste(img, (x, y))
     
-    # Save row image
     row_filename = f'seed{seed:04d}_row.png'
     row_path = os.path.join(outdir, row_filename)
     row_img.save(row_path)

@@ -100,7 +100,7 @@ def generate_images(
             
             # Apply binary thresholding and handle different channel formats
             if img_np.shape[2] == 1:  # Single channel (grayscale)
-                img_np = img_np.squeeze(2)  # Remove channel dimension
+                img_np = img_np.squeeze(2)
                 # Apply binary thresholding (threshold = 128)
                 img_binary = (img_np > 128).astype(np.uint8) * 255
                 PIL.Image.fromarray(img_binary, 'L').save(f'{outdir}/proj{idx:02d}.png')
@@ -136,7 +136,7 @@ def generate_images(
         
         # Apply binary thresholding and handle different channel formats
         if img_np.shape[2] == 1:  # Single channel (grayscale)
-            img_np = img_np.squeeze(2)  # Remove channel dimension
+            img_np = img_np.squeeze(2)
             # Apply binary thresholding (threshold = 128)
             img_binary = (img_np > 128).astype(np.uint8) * 255
             PIL.Image.fromarray(img_binary, 'L').save(f'{outdir}/seed{seed:04d}.png')
