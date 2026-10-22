@@ -1,5 +1,4 @@
-# UR-GAN: Feature-Adaptive Transfer Module (FATM) — 权重对齐阶段（特征空间自适应融合）
-# 对应论文 3.2：在选定分辨率层对基准路径与参考路径的特征做通道拼接与空间门控融合。
+"""Feature-adaptive transfer for cross-model alignment."""
 
 from __future__ import annotations
 
@@ -14,7 +13,7 @@ from training.networks import Conv2dLayer, SynthesisNetwork
 
 
 def default_fatm_resolutions(block_resolutions: Sequence[int]) -> List[int]:
-    """与论文一致：低分辨率若干层不融合，最后一层输出不融合，中间层引入 FATM。"""
+    """Select intermediate resolutions for feature fusion."""
     br = list(block_resolutions)
     if len(br) <= 4:
         return br[2:-1] if len(br) > 3 else []
@@ -23,7 +22,7 @@ def default_fatm_resolutions(block_resolutions: Sequence[int]) -> List[int]:
 
 @persistence.persistent_class
 class FeatureAdaptiveTransferModule(torch.nn.Module):
-    """对两路同分辨率特征做通道拼接，经卷积预测空间门控，再逐像素加权融合。"""
+    """Blend paired feature maps using a learned spatial gate."""
 
     def __init__(self, channels: int, hidden_ratio: int = 2):
         super().__init__()
@@ -41,7 +40,7 @@ class FeatureAdaptiveTransferModule(torch.nn.Module):
 
 @persistence.persistent_class
 class DualSynthesisNetworkFATM(torch.nn.Module):
-    """在单套 ws 下并行两条合成路径，于指定分辨率对主路径特征与参考路径特征做 FATM 融合。"""
+    """Fuse trainable and frozen synthesis branches at selected resolutions."""
 
     def __init__(
         self,
@@ -76,6 +75,11 @@ class DualSynthesisNetworkFATM(torch.nn.Module):
             p.requires_grad = False
         self.syn_b.eval()
 
+    def requires_grad_(self, requires_grad=True):
+        super().requires_grad_(requires_grad)
+        self.syn_b.requires_grad_(False)
+        return self
+
     def forward(self, ws, **block_kwargs):
         block_ws: List[torch.Tensor] = []
         with torch.autograd.profiler.record_function('split_ws'):
@@ -104,7 +108,7 @@ class DualSynthesisNetworkFATM(torch.nn.Module):
 
 
 def patch_generator_with_fatm(G, ref_generator_b, fatm_resolutions=None, device=None):
-    """将已有 Generator 的 synthesis 替换为 DualSynthesisNetworkFATM（参考路径来自第二个模型）。"""
+    """Attach FATM synthesis with a frozen reference branch."""
     syn_b = copy.deepcopy(ref_generator_b.synthesis).eval().requires_grad_(False)
     if device is not None:
         syn_b = syn_b.to(device)

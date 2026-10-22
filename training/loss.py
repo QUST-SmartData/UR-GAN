@@ -25,7 +25,7 @@ def _urgan_l2_param_drift(
     ref_module: torch.nn.Module,
     exclude_embed: bool = True,
 ) -> torch.Tensor:
-    """论文 3.5 权重对齐：‖θ - θ*‖²，仅在形状一致的参数上累加。"""
+    """Sum squared parameter drift over matching non-embedding tensors."""
     ref_params = dict(ref_module.named_parameters())
     device = None
     loss = None
@@ -47,7 +47,7 @@ def _urgan_l2_param_drift(
 
 
 def _urgan_get_trainable_synthesis_for_align(G_synthesis):
-    """FATM 双路合成时，对齐正则作用在 syn_a（基准可训练支路）。"""
+    """Select the trainable branch for synthesis alignment."""
     if hasattr(G_synthesis, 'syn_a'):
         return G_synthesis.syn_a
     return G_synthesis
@@ -64,7 +64,7 @@ def ewc_loss(
     reference_model_paremeters = dict(reference_model.named_parameters())
     train_model_paremeters = dict(train_model.named_parameters())
     for name in train_model_paremeters.keys():
-        # We do not want to enforce the same embedding as the old model
+        # Leave class embeddings unconstrained.
         full_name = weight_fisher_prefix + name
         if full_name not in ["mapping.embed.weight", 'mapping.embed.bias']:
             param_diff = train_model_paremeters[name] - reference_model_paremeters[name]
@@ -130,6 +130,8 @@ class StyleGAN2Loss(Loss):
         return logits
 
     def report_loss_for_each_class(self, input_classes, logits, data_type):
+        if input_classes.shape[1] == 0:
+            return
         class_indices = torch.argmax(input_classes, dim=1)
         for c in range(self.num_classes):  # type: ignore
             curr_logits = logits[class_indices == c]
@@ -173,7 +175,7 @@ class StyleGAN2Loss(Loss):
                     training_stats.report('Loss/G/synthesis_ewc', loss_generator_ewc_synthesis)
                     loss_Gmain = loss_Gmain + loss_generator_ewc_synthesis
 
-                # UR-GAN 3.5 权重对齐：对抗项 + λ‖θ-θ*‖²（仅在非 hybrid 的 merge 对齐阶段；θ* 默认 merge_generators[0]）
+                # Penalize weight drift from the alignment reference.
                 if self.urgan_align_lambda != 0 and (not self.hybrid_mode) and self.merge_generators and len(self.merge_generators) > self.urgan_align_ref_index:
                     ref_g = self.merge_generators[self.urgan_align_ref_index]
                     loss_align_map = _urgan_l2_param_drift(self.G_mapping, ref_g.mapping)
@@ -185,7 +187,7 @@ class StyleGAN2Loss(Loss):
                     training_stats.report('Loss/G/urgan_align_total', loss_align)
                     loss_Gmain = loss_Gmain + self.urgan_align_lambda * loss_align
 
-                # UR-GAN 3.5 权重融合：μ·‖α-0.5‖²，约束动态融合系数处于两域中间区域，减轻模式偏置
+                # Regularize fusion coefficients toward balanced contributions.
                 if self.urgan_fusion_lambda != 0 and self.hybrid_mode and self.synthesis_cond_args:
                     mlp = getattr(self.G_synthesis, 'coeff_mlp', None)
                     if mlp is not None:

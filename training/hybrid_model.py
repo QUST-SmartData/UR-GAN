@@ -40,7 +40,7 @@ class HybridGenerator(Generator):
             wts = [1.0 / n_src] * n_src
 
         self.requires_grad_(False)
-        # 安全平均：仅对形状一致的张量做平均；否则退回使用第一个源模型的张量
+        # Average source tensors with matching shapes.
         self_params = _pairs_to_dict(misc.named_params_and_buffers(self))
         first_params = generators_parameters[0]
         for name, tensor in self_params.items():
@@ -56,7 +56,7 @@ class HybridGenerator(Generator):
                     avg = sum(c.detach() for c in candidates) / float(len(candidates))
                 tensor.copy_(avg)
             else:
-                # 退回到第一个模型（根模型）的同名权重（若存在且同形状）
+                # Use the root tensor when its shape matches.
                 t0 = first_params.get(name, None)
                 if (t0 is not None) and (tuple(t0.shape) == tuple(tensor.shape)):
                     tensor.copy_(t0.detach())

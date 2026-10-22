@@ -12,7 +12,6 @@ from time import gmtime, strftime
 import copy
 import json
 import pickle
-from training.networks import Discriminator, Generator
 from typing import List
 import psutil
 import PIL.Image
@@ -27,9 +26,9 @@ from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import grid_sample_gradfix
-import wandb
 
 import legacy
+from training.merge_utils import extend_GAN_embeddings
 from metrics import metric_main
 from constants import *
 
@@ -100,6 +99,16 @@ def save_image_grid(img, fname, drange, grid_size):
     image_grid = get_image_grid(img=img, drange=drange, grid_size=grid_size)
     image_grid.save(fname)
 
+@torch.no_grad()
+def generate_snapshot_images(generator, latent_batches, class_idx):
+    images = []
+    for z in latent_batches:
+        c = torch.zeros([len(z), generator.c_dim], device=z.device)
+        if generator.c_dim:
+            c[:, class_idx] = 1
+        images.append(generator(z=z, c=c, noise_mode='const').cpu())
+    return torch.cat(images).numpy()
+
 def get_models(model_paths: List[str], new_n_classes: int, device):
     generators = []
     discriminators = []
@@ -143,10 +152,10 @@ def sample_merge_generators(merge_generators, batch_size, class_percentages, dev
     for i, (generator, curr_batch_size) in enumerate(zip(merge_generators, class_batch_sizes)):
         if curr_batch_size != 0:
             z = torch.randn([curr_batch_size, generator.z_dim], device=device)
-            # In the future we can make the "index_value" configureable, but for now we can leave it as the first class
+            # Rooted source models are sampled through their first condition.
             c = get_one_hot_batch(index_value=0, num_classes=len(class_percentages), batch_size=curr_batch_size).to(device)
 
-            # FATM 阶段为省显存会把 merge 源模型放在 CPU；此处临时上 GPU 采样后再迁回
+            # Move CPU-resident sources to the training device only for sampling.
             on_cpu = next(generator.parameters()).device.type == 'cpu'
             gen = generator.to(device)
             samples.append(gen(z=z, c=c, noise_mode='const'))
@@ -158,59 +167,6 @@ def sample_merge_generators(merge_generators, batch_size, class_percentages, dev
     labels = torch.cat(labels, dim=0)
 
     return samples, labels
-
-def extend_GAN_embeddings(input_G, input_D, new_n_classes):
-    input_G.cpu()
-    input_D.cpu()
-
-    # 使用输入模型的结构超参构建输出模型，仅将 c_dim 扩展为 new_n_classes，避免形状不一致
-    output_G = Generator(
-                         z_dim=input_G.z_dim,
-                         c_dim=new_n_classes,
-                         w_dim=input_G.w_dim,
-                         img_channels=input_G.img_channels,
-                         img_resolution=input_G.img_resolution,
-                         mapping_kwargs={'num_layers': getattr(getattr(input_G, 'mapping', None), 'num_layers', 8)},
-                         synthesis_kwargs={
-                             'channel_base': getattr(getattr(input_G, 'synthesis', None), 'channel_base', 32768),
-                             'channel_max': getattr(getattr(input_G, 'synthesis', None), 'channel_max', 512),
-                             'conv_clamp': getattr(getattr(input_G, 'synthesis', None), 'conv_clamp', 256),
-                             'num_fp16_res': getattr(getattr(input_G, 'synthesis', None), 'num_fp16_res', 4)
-                         })
-    output_G = output_G.eval().requires_grad_(False).cpu()
-
-    output_D = Discriminator(
-                             c_dim=new_n_classes,
-                             img_resolution=input_D.img_resolution,
-                             img_channels=input_D.img_channels,
-                             architecture=getattr(input_D, 'architecture', 'resnet'),
-                             channel_base=getattr(input_D, 'channel_base', 32768),
-                             channel_max=getattr(input_D, 'channel_max', 512),
-                             num_fp16_res=getattr(input_D, 'num_fp16_res', 4),
-                             conv_clamp=getattr(input_D, 'conv_clamp', 256),
-                             epilogue_kwargs={'mbstd_group_size': getattr(getattr(input_D, 'epilogue', None), 'mbstd_group_size', 4)})
-    output_D = output_D.eval().requires_grad_(False).cpu()
-
-    assert input_G.c_dim < output_G.c_dim, "New number of classes must to be bigger than the old one"
-
-    # 仅复制同名且同形状的权重/缓冲，跳过新增维度（例如类嵌入扩展部分）
-    def _pairs_to_dict(pairs_or_dict):
-        # misc.named_params_and_buffers 可能返回 list[(name,tensor)] 或 dict{name:tensor}
-        if isinstance(pairs_or_dict, dict):
-            return pairs_or_dict
-        return {k: v for k, v in pairs_or_dict}
-
-    def _safe_copy(src_module, dst_module):
-        src_tensors = _pairs_to_dict(misc.named_params_and_buffers(src_module))
-        for name, dst_tensor in _pairs_to_dict(misc.named_params_and_buffers(dst_module)).items():
-            src_tensor = src_tensors.get(name, None)
-            if (src_tensor is not None) and (tuple(src_tensor.shape) == tuple(dst_tensor.shape)):
-                dst_tensor.copy_(src_tensor.detach())
-
-    _safe_copy(input_G, output_G)
-    _safe_copy(input_D, output_D)
-    
-    return output_G, output_D
 
 #----------------------------------------------------------------------------
 
@@ -269,8 +225,8 @@ def training_loop(
     evaluate_metrics_first_tick = None,  # Indicator to evaluate all the metrics on the first tick
     hybrid_mode = None, # Indicator for "hybrid mode" - use a model with averaging the weights
     hybrid_model_paths = None,  # The source pickles of the second fine-tuned model (from the first merge generator)
-    use_fatm = False,  # UR-GAN 权重对齐：在合成网络中插入 FATM（需 merge_mode 且非 hybrid_mode）
-    use_pdfm = False,  # UR-GAN 权重融合：混合阶段使用 PDFM 逐层系数（需 hybrid_mode）
+    use_fatm = False,  # Enable feature-adaptive alignment.
+    use_pdfm = False,  # Enable layer-wise dynamic fusion.
 ):
     # Initialize.
     start_time = time.time()
@@ -287,6 +243,7 @@ def training_loop(
     if rank == 0:
         print_log('Loading training set...')
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
+    num_classes = training_set.label_dim
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     if not merge_mode:
         training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
@@ -339,7 +296,7 @@ def training_loop(
                     print_log('UR-GAN FATM: dual synthesis + spatial feature fusion enabled (ref = merge_models[1]).')
                 patch_generator_with_fatm(G, merge_generators[1], device=device)
                 G.requires_grad_(False)
-                # 参考支路已 deepcopy 进 G.synthesis.syn_b，将源 merge 模型挪到 CPU 以释放显存
+                # Keep sampling sources on CPU while FATM owns its reference copy.
                 for _mg in merge_generators:
                     _mg.cpu()
                 for _md in merge_discriminators:
@@ -364,7 +321,7 @@ def training_loop(
             del root_generator
             del root_discriminator
 
-    # FATM 时 deepcopy 在 CPU 上进行，降低显存峰值（再载入 GPU）
+    # Copy FATM on CPU to reduce peak GPU memory use.
     if use_fatm and merge_mode and not hybrid_mode:
         G_ema = copy.deepcopy(G.cpu()).eval().to(device)
         G.to(device)
@@ -383,8 +340,6 @@ def training_loop(
             if init_merge_discriminator:
                 print_log("Discarding merge discriminator for resume pkl")
 
-        # All this resuming was initially only on rank 0 device, but I think it should be
-        # done on all the devices. Need to check it again
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
@@ -449,7 +404,7 @@ def training_loop(
                                               merge_generators=merge_generators, merge_discriminators=merge_discriminators,
                                               fisher_coefficients=fisher_coefficients, ewc_reference_model_index=ewc_reference_model_index,
                                               generator_mapping_ewc_lambda=generator_mapping_ewc_lambda, generator_synthesis_ewc_lambda=generator_synthesis_ewc_lambda,
-                                              discriminator_ewc_lambda=discriminator_ewc_lambda, num_classes=training_set.num_classes) # subclass of training.loss.Loss
+                                              discriminator_ewc_lambda=discriminator_ewc_lambda, num_classes=num_classes) # subclass of training.loss.Loss
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
@@ -478,23 +433,18 @@ def training_loop(
 
 
     # Export sample images.
-    # 若未从外部指定，就用默认可视化样本数
     if num_samples is None:
-        num_samples = 16 if (use_fatm and merge_mode) else 64  # FATM 双路合成显存大，预览图默认减少
+        num_samples = 16 if (use_fatm and merge_mode) else 64
     grid_size = (int(math.sqrt(num_samples)), int(math.sqrt(num_samples)))
     grid_z = None
     if rank == 0:
-        # 确保samples目录存在
         samples_dir = os.path.join(run_dir, SAMPLES_DIR)
         os.makedirs(samples_dir, exist_ok=True)
 
         snap_batch_gpu = min(batch_gpu, 4) if (use_fatm and merge_mode) else batch_gpu
         grid_z = torch.randn([num_samples, G.z_dim], device=device).split(snap_batch_gpu)
-        for class_idx in range(training_set.num_classes):
-            class_one_hot = F.one_hot(torch.tensor(class_idx), num_classes=training_set.num_classes).to(device)
-            class_one_hot = class_one_hot.repeat(snap_batch_gpu, 1)
-            with torch.no_grad():
-                images = torch.cat([G_ema(z=z, c=class_one_hot, noise_mode='const').cpu() for z in grid_z]).numpy()
+        for class_idx in range(max(num_classes, 1)):
+            images = generate_snapshot_images(G_ema, grid_z, class_idx)
             save_image_grid(images, os.path.join(run_dir, SAMPLES_DIR, f'fakes_init_{class_idx}.png'), drange=[-1,1], grid_size=grid_size)
             torch.cuda.empty_cache()
 
@@ -509,6 +459,7 @@ def training_loop(
         stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'wt')
 
         if log_wandb and not debug:
+            import wandb
             wandb_logger = wandb.init(
                 project="stylegan2-ada-pytorch",
                 name=job_desc,
@@ -547,15 +498,14 @@ def training_loop(
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
-            all_gen_c = torch.multinomial(torch.tensor(class_percentages), num_samples=len(phases) * batch_size, replacement=True)
-            all_gen_c = [F.one_hot(c, num_classes=training_set.label_shape[0]) for c in all_gen_c]
-            all_gen_c = torch.stack(all_gen_c).pin_memory().to(device)
-           
+            if merge_mode:
+                class_indices = torch.multinomial(torch.tensor(class_percentages), num_samples=len(phases) * batch_size, replacement=True)
+                all_gen_c = F.one_hot(class_indices, num_classes=num_classes).float()
+            else:
+                labels = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
+                all_gen_c = torch.from_numpy(np.stack(labels))
+            all_gen_c = all_gen_c.pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
-
-            # all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
-            # all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
-            # all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
         # Execute training phases.
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
@@ -567,6 +517,8 @@ def training_loop(
                 phase.start_event.record(torch.cuda.current_stream(device))
             phase.opt.zero_grad(set_to_none=True)
             phase.module.requires_grad_(True)
+            if phase.name.startswith('G'):
+                G.synthesis.requires_grad_(True)
 
             # Accumulate gradients over multiple rounds.
             for round_idx, (real_img, real_c, gen_z, gen_c) in enumerate(zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c)):
@@ -638,14 +590,11 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            # 确保samples目录存在
             samples_dir = os.path.join(run_dir, SAMPLES_DIR)
             os.makedirs(samples_dir, exist_ok=True)
             
-            for class_idx in range(training_set.num_classes):
-                class_one_hot = F.one_hot(torch.tensor(class_idx), num_classes=training_set.num_classes).to(device)
-                class_one_hot = class_one_hot.repeat(batch_gpu, 1)
-                images = torch.cat([G_ema(z=z, c=class_one_hot, noise_mode='const').cpu() for z in grid_z]).numpy()
+            for class_idx in range(max(num_classes, 1)):
+                images = generate_snapshot_images(G_ema, grid_z, class_idx)
 
                 curr_fake_grid = get_image_grid(images, drange=[-1,1], grid_size=grid_size)
                 curr_fake_grid.save(os.path.join(run_dir, SAMPLES_DIR, f'sample_class_{class_idx}_{cur_nimg//1000:06d}.png'))
@@ -675,7 +624,6 @@ def training_loop(
 
             snapshot_pkl = os.path.join(run_dir, CHECKPOINTS_DIR, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
-                # 确保checkpoints目录存在
                 checkpoints_dir = os.path.join(run_dir, CHECKPOINTS_DIR)
                 os.makedirs(checkpoints_dir, exist_ok=True)
                 
@@ -683,9 +631,9 @@ def training_loop(
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
 
-                # Delete the old checkpoints
+                # Retain the configured number of checkpoints.
                 if save_last_k_checkpoints is None:
-                    save_last_k_checkpoints = 5  # 默认保存最近5个检查点
+                    save_last_k_checkpoints = 5
                 if save_last_k_checkpoints != -1:
                     checkpoints_list = sorted(
                         Path(os.path.join(run_dir, CHECKPOINTS_DIR)).iterdir(),
@@ -704,21 +652,20 @@ def training_loop(
             for metric in metrics:
                 # Compute the metric for each class
                 average_metric = 0
-                for class_idx, class_name in enumerate(training_set.class_names):
-                    # 为合并模式提供默认的dataset_kwargs
-                    if merge_mode and class_name not in metrics_dataset_kwargs:
-                        # 使用训练集的配置作为默认配置（仅传必要字段）
+                class_names = training_set.class_names if merge_mode else [training_set.name]
+                for class_idx, class_name in enumerate(class_names):
+                    if class_name not in metrics_dataset_kwargs:
                         default_kwargs = {
                             'class_name': 'training.dataset.ImageFolderDataset',
-                            'path': training_set.datasets[class_idx]._path,
-                            'use_labels': training_set.datasets[class_idx]._use_labels,
-                            'resolution': training_set.datasets[class_idx].resolution
+                            'path': training_set.datasets[class_idx]._path if merge_mode else training_set._path,
+                            'use_labels': False if merge_mode else training_set_kwargs.use_labels,
+                            'resolution': training_set.resolution
                         }
                         dataset_kwargs = default_kwargs
                     else:
                         dataset_kwargs = metrics_dataset_kwargs.get(class_name, {})
                     
-                    # 为逐类评估固定生成端的条件标签：class_idx -> one-hot
+                    # Fix the generated condition for per-source metrics.
                     result_dict = metric_main.calc_metric(
                         metric=metric,
                         G=snapshot_data['G_ema'],
@@ -726,7 +673,7 @@ def training_loop(
                         num_gpus=num_gpus,
                         rank=rank,
                         device=device,
-                        G_kwargs={'force_c_one_hot': class_idx}
+                        G_kwargs={'force_c_one_hot': class_idx} if merge_mode else {}
                     )
                     average_metric += result_dict["results"][metric]
                     result_dict["results"] = {f"{k}_{class_name}": v for k, v in result_dict["results"].items()}
@@ -735,7 +682,7 @@ def training_loop(
                         metric_main.report_metric(result_dict, run_dir=run_dir, snapshot_pkl=snapshot_pkl)
                     stats_metrics.update(result_dict.results)
 
-                average_metric /= len(training_set.class_names)
+                average_metric /= len(class_names)
                 stats_metrics.update({f"average_{metric}": average_metric})
                 
                 if compute_metrics_all_data:

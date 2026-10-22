@@ -1,5 +1,4 @@
-# UR-GAN: Parameter-Level Dynamic Fusion (PDFM) — 权重融合阶段（由 z、c 生成逐层融合系数）
-# 对应论文 3.3：条件编码后生成系数，对各层激活做逐层凸组合（参考路径冻结，系数网络可训练）。
+"""Condition-dependent layer-wise fusion of aligned synthesis branches."""
 
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ from training.networks import Generator, SynthesisNetwork
 
 
 def _average_mapping_into(dst_gen: Generator, sources: List[Generator]) -> None:
-    """将多个 Generator 的 mapping 参数均值写入 dst_gen.mapping。"""
+    """Initialize mapping tensors from matching source averages."""
     def pairs_to_dict(pairs_or_dict):
         if isinstance(pairs_or_dict, dict):
             return pairs_or_dict
@@ -37,7 +36,7 @@ def _average_mapping_into(dst_gen: Generator, sources: List[Generator]) -> None:
 
 @persistence.persistent_class
 class LayerBlendSynthesis(torch.nn.Module):
-    """两套冻结 synthesis 在每一尺度上用 α_l(z,c) 做特征与 RGB 累积的凸组合。"""
+    """Blend frozen synthesis features and RGB outputs at each resolution."""
 
     def __init__(
         self,
@@ -74,7 +73,14 @@ class LayerBlendSynthesis(torch.nn.Module):
         self.syn_a.eval()
         self.syn_b.eval()
 
+    def requires_grad_(self, requires_grad=True):
+        super().requires_grad_(requires_grad)
+        self.syn_a.requires_grad_(False)
+        self.syn_b.requires_grad_(False)
+        return self
+
     def forward(self, ws, z: Optional[torch.Tensor] = None, c: Optional[torch.Tensor] = None, **block_kwargs):
+        synthesis_b = getattr(self.syn_b, 'syn_a', self.syn_b)
         block_ws: List[torch.Tensor] = []
         with torch.autograd.profiler.record_function('split_ws'):
             misc.assert_shape(ws, [None, self.num_ws, None])
@@ -90,7 +96,7 @@ class LayerBlendSynthesis(torch.nn.Module):
         device = ws.device
         if z is None:
             z = torch.zeros(B, self.z_dim, device=device)
-        parts = [z]
+        parts = [z.to(torch.float32)]
         if self.c_dim > 0:
             if c is None:
                 raise ValueError('PDFM synthesis expects class tensor c when c_dim > 0')
@@ -99,13 +105,20 @@ class LayerBlendSynthesis(torch.nn.Module):
 
         x_a = img_a = None
         x_b = img_b = None
+        x_ref = img_ref = None
         for blk_idx, (res, cur_ws) in enumerate(zip(self.block_resolutions, block_ws)):
             a = alpha_all[:, blk_idx].view(B, 1, 1, 1)
             block_a = getattr(self.syn_a, f'b{res}')
-            block_b = getattr(self.syn_b, f'b{res}')
+            block_b = getattr(synthesis_b, f'b{res}')
             x_a, img_a = block_a(x_a, img_a, cur_ws, **block_kwargs)
             with torch.no_grad():
                 x_b, img_b = block_b(x_b, img_b, cur_ws, **block_kwargs)
+                # Preserve the aligned model's FATM gates during fusion.
+                if hasattr(self.syn_b, 'fatm'):
+                    ref_block = getattr(self.syn_b.syn_b, f'b{res}')
+                    x_ref, img_ref = ref_block(x_ref, img_ref, cur_ws, **block_kwargs)
+                    if str(res) in self.syn_b.fatm:
+                        x_b = self.syn_b.fatm[str(res)](x_b, x_ref)
 
             x_a = a * x_a + (1.0 - a) * x_b.detach()
 
@@ -123,7 +136,7 @@ class LayerBlendSynthesis(torch.nn.Module):
 
 @persistence.persistent_class
 class PDFMLayerHybridGenerator(Generator):
-    """Hybrid 架构 + PDFM：mapping 可训练（由源模型均值初始化），synthesis 为双路径逐层系数融合。"""
+    """Train a shared mapping and dynamic coefficients over frozen sources."""
 
     def __init__(
         self,

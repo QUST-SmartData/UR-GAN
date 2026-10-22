@@ -67,16 +67,7 @@ def get_plugin(module_name, sources, **build_kwargs):
         # Compile and load.
         verbose_build = (verbosity == 'full')
 
-        # Incremental build md5sum trickery.  Copies all the input source files
-        # into a cached build directory under a combined md5 digest of the input
-        # source files.  Copying is done only if the combined digest has changed.
-        # This keeps input file timestamps and filenames the same as in previous
-        # extension builds, allowing for fast incremental rebuilds.
-        #
-        # This optimization is done only in case all the source files reside in
-        # a single directory (just for simplicity) and if the TORCH_EXTENSIONS_DIR
-        # environment variable is set (we take this as a signal that the user
-        # actually cares about this.)
+        # Cache colocated sources by content hash for incremental builds.
         source_dirs_set = set(os.path.dirname(source) for source in sources)
         if len(source_dirs_set) == 1 and ('TORCH_EXTENSIONS_DIR' in os.environ):
             all_source_files = sorted(list(x for x in Path(list(source_dirs_set)[0]).iterdir() if x.is_file()))

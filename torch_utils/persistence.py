@@ -6,12 +6,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-"""Facilities for pickling Python code alongside other data.
-
-The pickled code is automatically imported into a separate Python module
-during unpickling. This way, any previously exported pickles will remain
-usable even if the original code is no longer available, or if the current
-version of the code is not consistent with what was originally pickled."""
+"""Serialize class source code and restore it in isolated Python modules."""
 
 import sys
 import pickle
@@ -51,11 +46,8 @@ def persistent_class(orig_class):
         class MyLayer(torch.nn.Module):
             ...
 
-    When pickled, any instance of `MyNetwork` and `MyLayer` will save its
-    source code alongside other internal state (e.g., parameters, buffers,
-    and submodules). This way, any previously exported pickle will remain
-    usable even if the class definitions have been modified or are no
-    longer available.
+    Instances save their module source alongside parameters, buffers, and
+    submodules.
 
     The decorator saves the source code of the entire Python module
     containing the decorated class. It does *not* save the source code of
@@ -79,14 +71,7 @@ def persistent_class(orig_class):
     arguments that were used to construct each instance of the decorated
     class. The arguments can be queried via `obj.init_args` and
     `obj.init_kwargs`, and they are automatically pickled alongside other
-    object state. A typical use case is to first unpickle a previous
-    instance of a persistent class, and then upgrade it to use the latest
-    version of the source code:
-
-        with open('old_pickle.pkl', 'rb') as f:
-            old_net = pickle.load(f)
-        new_net = MyNetwork(*old_obj.init_args, **old_obj.init_kwargs)
-        misc.copy_params_and_buffers(old_net, new_net, require_all=True)
+    object state.
     """
     assert isinstance(orig_class, type)
     if is_persistent(orig_class):

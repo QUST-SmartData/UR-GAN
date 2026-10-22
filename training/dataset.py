@@ -178,6 +178,10 @@ class ImageFolderDataset(Dataset):
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
+        if raw_shape[1] not in [1, 3]:
+            raise IOError('Images must be 8-bit grayscale or RGB')
+        if raw_shape[2] != raw_shape[3] or raw_shape[2] < 4 or raw_shape[2] & (raw_shape[2] - 1):
+            raise IOError('Images must be square with a power-of-two resolution of at least 4')
         if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
             raise IOError('Image files do not match the specified resolution')
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
@@ -216,6 +220,8 @@ class ImageFolderDataset(Dataset):
                 image = pyspng.load(f.read())
             else:
                 image = np.array(PIL.Image.open(f))
+        if image.dtype != np.uint8:
+            raise IOError(f'Image must use 8-bit pixels: {fname}')
         if image.ndim == 2:
             image = image[:, :, np.newaxis] # HW => HWC
         image = image.transpose(2, 0, 1) # HWC => CHW
@@ -244,15 +250,23 @@ class MergedImageFolderDataset(torch.utils.data.Dataset):
         resolution      = None, # Ensure specific resolution, None = highest available.
         **super_kwargs,         # Additional arguments for the Dataset base class.
     ):
+        if not paths or num_classes != len(paths):
+            raise IOError('The class count must match the number of source datasets')
         self.datasets = []
         for path in paths:
             self.datasets.append(ImageFolderDataset(path=path, resolution=resolution, **super_kwargs))
 
         datasets_lengths = [len(d) for d in self.datasets]
 
-        # print(f"Loading datasets in paths: {paths} of lengths: {datasets_lengths}")
+        if any(d.image_shape != self.datasets[0].image_shape for d in self.datasets):
+            self.close()
+            raise IOError('Source datasets must have matching resolutions and channel counts')
         self.max_dataset_len = max(datasets_lengths)
         self.num_classes = num_classes
+
+    def close(self):
+        for dataset in self.datasets:
+            dataset.close()
 
     def __len__(self) -> int:
         return self.max_dataset_len
@@ -264,13 +278,12 @@ class MergedImageFolderDataset(torch.utils.data.Dataset):
 
         item_index_in_dataset = (index // len(self.datasets)) % len(selected_dataset)
 
-        class_one_hot = F.one_hot(torch.tensor(dataset_index), num_classes=self.num_classes)
+        class_one_hot = F.one_hot(torch.tensor(dataset_index), num_classes=self.num_classes).float()
 
         return selected_dataset[item_index_in_dataset][0], class_one_hot
 
     @property
     def name(self):
-        # return [d.name for d in self.datasets]
         name = "_and_".join([d.name for d in self.datasets])
         return f"merged_{name}"
 

@@ -240,7 +240,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
 
     # Image generation func.
     def run_generator(z, c):
-        # 过滤掉不被 G.forward 接受的评估辅助参数（例如 force_c_one_hot）
+        # Keep metric-only options out of the generator call.
         g_kwargs = dict(getattr(opts, 'G_kwargs', {}) or {})
         if 'force_c_one_hot' in g_kwargs:
             g_kwargs.pop('force_c_one_hot')
@@ -266,10 +266,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
         for _i in range(batch_size // batch_gen):
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
 
-            # Build conditional label c with robust fallback:
-            # 1) If dataset provides labels (and label_dim>0), use them.
-            # 2) Otherwise, if G is conditional (c_dim>0), uniformly sample one-hot labels.
-            # 3) Else, use empty condition.
+            # Use dataset labels or sample a generator condition.
             label_dim = 0
             if hasattr(dataset, 'label_shape') and len(dataset.label_shape) > 0:
                 try:
@@ -277,7 +274,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
                 except Exception:
                     label_dim = 0
 
-            use_ds_labels = bool(getattr(dataset, 'use_labels', False)) and (label_dim > 0)
+            use_ds_labels = dataset.has_labels and (label_dim > 0)
 
             if use_ds_labels:
                 c_np = [dataset.get_label(np.random.randint(len(dataset))) for _ in range(batch_gen)]
@@ -285,14 +282,11 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
             else:
                 num_classes = int(getattr(G, 'c_dim', 0))
                 if num_classes > 0:
-                    # 检查是否强制使用特定的one-hot类别
                     force_c_one_hot = getattr(opts.G_kwargs, 'force_c_one_hot', None)
                     if force_c_one_hot is not None:
-                        # 强制使用指定的类别
                         idx = torch.full((batch_gen,), force_c_one_hot, device=opts.device)
                         c = torch.nn.functional.one_hot(idx, num_classes=num_classes).float()
                     else:
-                        # 随机采样类别
                         idx = torch.randint(num_classes, (batch_gen,), device=opts.device)
                         c = torch.nn.functional.one_hot(idx, num_classes=num_classes).float()
                 else:

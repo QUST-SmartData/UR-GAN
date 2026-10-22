@@ -76,26 +76,19 @@ def extend_GAN_embeddings(input_G, input_D, new_n_classes):
     input_G.cpu()
     input_D.cpu()
 
-    output_G = Generator(z_dim=input_G.z_dim,
-                         c_dim=new_n_classes,
-                         w_dim=input_G.w_dim,
-                         img_channels=input_G.img_channels,
-                         img_resolution=input_G.img_resolution,
-                         mapping_kwargs={'num_layers': 8},
-                         synthesis_kwargs={'channel_base': 32768, 'channel_max': 512, 'conv_clamp': 256, 'num_fp16_res': 4})
+    generator_kwargs = dict(input_G.init_kwargs)
+    generator_kwargs['c_dim'] = new_n_classes
+    output_G = Generator(**generator_kwargs)
     output_G = output_G.eval().requires_grad_(False).cpu()
 
-    output_D = Discriminator(c_dim=new_n_classes,
-                             img_resolution=input_D.img_resolution,
-                             img_channels=input_D.img_channels,
-                             num_fp16_res=4,
-                             conv_clamp=256,
-                             epilogue_kwargs={'mbstd_group_size': 4})
+    discriminator_kwargs = dict(input_D.init_kwargs)
+    discriminator_kwargs['c_dim'] = new_n_classes
+    output_D = Discriminator(**discriminator_kwargs)
     output_D = output_D.eval().requires_grad_(False).cpu()
 
-    assert input_G.c_dim < output_G.c_dim, "New number of classes must to be bigger than the old one"
+    assert input_G.c_dim < output_G.c_dim, "Target class count must exceed the source class count"
 
-    # 安全复制：仅在名称相同且张量形状一致时复制权重/缓冲，避免因类嵌入大小改变而报错
+    # Preserve matching tensors while initializing expanded class embeddings.
     def _pairs_to_dict(pairs_or_dict):
         if isinstance(pairs_or_dict, dict):
             return pairs_or_dict
